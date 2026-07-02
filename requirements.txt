@@ -1,0 +1,5 @@
+pandas
+matplotlib
+python-pptx
+openpyxl
+tkinterdnd2
