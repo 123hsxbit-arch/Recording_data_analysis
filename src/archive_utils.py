@@ -3,7 +3,7 @@ from __future__ import annotations
 import gzip
 import re
 import shutil
-import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,31 +40,41 @@ def normalize_date(date_text: str | None) -> str | None:
     return normalized
 
 
-def extract_zip_archives(raw_data_dir: Path, extracted_data_dir: Path) -> list[Path]:
-    """Extract all zip archives under raw data directory."""
-    extracted_data_dir.mkdir(parents=True, exist_ok=True)
-    zip_paths = sorted(raw_data_dir.glob("*.zip"))
+def normalize_dates(date_values: list[str] | str | None) -> set[str] | None:
+    """Normalize date input to a set of YYYYMMDD values, or None for all dates."""
+    if date_values is None:
+        return None
 
-    for zip_path in zip_paths:
-        marker_path = extracted_data_dir / f".{zip_path.stem}.extracted"
-        if marker_path.exists():
-            continue
+    if isinstance(date_values, str):
+        date_values = [date_values]
 
-        _safe_extract_zip(zip_path, extracted_data_dir)
-        marker_path.touch()
+    normalized_dates = {
+        normalized
+        for value in date_values
+        if (normalized := normalize_date(value)) is not None
+    }
+    return normalized_dates or None
 
-    return sorted(path for path in extracted_data_dir.iterdir() if path.is_dir())
+
+def discover_recording_dates(input_path: Path) -> list[str]:
+    """Discover available YYYYMMDD recording dates from an extracted recording folder."""
+    input_path = input_path.resolve()
+
+    if not input_path.is_dir():
+        return []
+
+    return sorted(_discover_dates_in_extracted_dir(input_path))
 
 
-def find_voltage_recordings(extracted_data_dir: Path, date: str | None) -> list[VoltageRecording]:
+def find_voltage_recordings(extracted_data_dir: Path, dates: set[str] | None) -> list[VoltageRecording]:
     """Find RBMS gz files for the selected date, or all dates when date is None."""
     recordings: list[VoltageRecording] = []
 
-    for cluster_dir in extracted_data_dir.rglob("*"):
+    for cluster_dir in _iter_dirs_including_root(extracted_data_dir):
         if not cluster_dir.is_dir() or not RBMS_FOLDER_PATTERN.match(cluster_dir.name):
             continue
 
-        date_dirs = _find_date_dirs(cluster_dir, date)
+        date_dirs = _find_date_dirs(cluster_dir, dates)
         for date_dir in date_dirs:
             for gz_path in sorted(date_dir.glob("*.csv.gz")):
                 csv_path = extract_gz_csv(gz_path)
@@ -80,16 +90,16 @@ def find_voltage_recordings(extracted_data_dir: Path, date: str | None) -> list[
     return recordings
 
 
-def find_temperature_recordings(extracted_data_dir: Path, date: str | None) -> list[TemperatureRecording]:
+def find_temperature_recordings(extracted_data_dir: Path, dates: set[str] | None) -> list[TemperatureRecording]:
     """Find RBMS recordings and their mapped TMS recordings for temperature analysis."""
-    tms_index = _build_tms_index(extracted_data_dir, date)
+    tms_index = _build_tms_index(extracted_data_dir, dates)
     recordings: list[TemperatureRecording] = []
 
-    for cluster_dir in extracted_data_dir.rglob("*"):
+    for cluster_dir in _iter_dirs_including_root(extracted_data_dir):
         if not cluster_dir.is_dir() or not RBMS_FOLDER_PATTERN.match(cluster_dir.name):
             continue
 
-        date_dirs = _find_date_dirs(cluster_dir, date)
+        date_dirs = _find_date_dirs(cluster_dir, dates)
         for date_dir in date_dirs:
             tms_name = map_rbms_to_tms_name(cluster_dir.name)
             tms_csv_path = tms_index.get((tms_name, date_dir.name))
@@ -119,14 +129,14 @@ def map_rbms_to_tms_name(rbms_folder_name: str) -> str | None:
     return f"{match.group('prefix')}.TMS{tms_number}"
 
 
-def _build_tms_index(extracted_data_dir: Path, date: str | None) -> dict[tuple[str | None, str], Path]:
+def _build_tms_index(extracted_data_dir: Path, dates: set[str] | None) -> dict[tuple[str | None, str], Path]:
     tms_index: dict[tuple[str | None, str], Path] = {}
 
-    for tms_dir in extracted_data_dir.rglob("*"):
+    for tms_dir in _iter_dirs_including_root(extracted_data_dir):
         if not tms_dir.is_dir() or not TMS_FOLDER_PATTERN.match(tms_dir.name):
             continue
 
-        date_dirs = _find_date_dirs(tms_dir, date)
+        date_dirs = _find_date_dirs(tms_dir, dates)
         for date_dir in date_dirs:
             for gz_path in sorted(date_dir.glob("*.csv.gz")):
                 tms_index[(tms_dir.name, date_dir.name)] = extract_gz_csv(gz_path)
@@ -135,16 +145,39 @@ def _build_tms_index(extracted_data_dir: Path, date: str | None) -> dict[tuple[s
     return tms_index
 
 
-def _find_date_dirs(cluster_dir: Path, date: str | None) -> list[Path]:
-    if date is not None:
-        date_dir = cluster_dir / date
-        return [date_dir] if date_dir.is_dir() else []
+def _find_date_dirs(cluster_dir: Path, dates: set[str] | None) -> list[Path]:
+    if dates is not None:
+        return sorted(
+            date_dir
+            for date in dates
+            if (date_dir := cluster_dir / date).is_dir()
+        )
 
     return sorted(
         path
         for path in cluster_dir.iterdir()
         if path.is_dir() and re.fullmatch(r"\d{8}", path.name)
     )
+
+
+def _discover_dates_in_extracted_dir(input_dir: Path) -> set[str]:
+    dates: set[str] = set()
+
+    for cluster_dir in _iter_dirs_including_root(input_dir):
+        if not cluster_dir.is_dir() or not RBMS_FOLDER_PATTERN.match(cluster_dir.name):
+            continue
+
+        for date_dir in cluster_dir.iterdir():
+            if date_dir.is_dir() and re.fullmatch(r"\d{8}", date_dir.name):
+                dates.add(date_dir.name)
+
+    return dates
+
+
+def _iter_dirs_including_root(root: Path) -> Iterator[Path]:
+    if root.is_dir():
+        yield root
+    yield from (path for path in root.rglob("*") if path.is_dir())
 
 
 def extract_gz_csv(gz_path: Path) -> Path:
@@ -158,25 +191,3 @@ def extract_gz_csv(gz_path: Path) -> Path:
             shutil.copyfileobj(source, target)
 
     return csv_path
-
-
-def _safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
-    try:
-        archive = zipfile.ZipFile(zip_path, metadata_encoding="gbk")
-    except TypeError:
-        archive = zipfile.ZipFile(zip_path)
-
-    with archive:
-        for member in archive.infolist():
-            destination = (target_dir / member.filename).resolve()
-            if not _is_relative_to(destination, target_dir.resolve()):
-                raise ValueError(f"Unsafe path in zip archive: {member.filename}")
-            archive.extract(member, target_dir)
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False

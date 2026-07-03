@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--raw-input-path",
         default=str(RAW_DATA_DIR),
-        help="输入路径，可为包含 zip 的目录、已解压目录或单个 zip 文件。",
+        help="输入路径，必须是已解压的录播数据文件夹。",
     )
     parser.add_argument(
         "--output-dir",

@@ -1,16 +1,13 @@
 from __future__ import annotations
-
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from archive_utils import (
     RBMS_FOLDER_PATTERN,
-    extract_zip_archives,
     find_temperature_recordings,
     find_voltage_recordings,
-    normalize_date,
+    normalize_dates,
 )
 from config import (
     DEFAULT_CELL_TEMPERATURE_COUNT,
@@ -39,6 +36,7 @@ LogFn = Callable[[str], None]
 class AnalysisRunConfig:
     analysis_type: str = "voltage"
     date: str | None = None
+    dates: list[str] | None = None
     raw_input_path: Path = RAW_DATA_DIR
     output_dir: Path = OUTPUT_DIR
     work_dir: Path = PROCESSED_DATA_DIR
@@ -53,7 +51,7 @@ class AnalysisRunConfig:
 
 
 def run_analysis(config: AnalysisRunConfig, log: LogFn = print) -> dict[str, list[Path] | Path | None]:
-    date = normalize_date(config.date)
+    dates = normalize_dates(config.dates if config.dates is not None else config.date)
     extracted_data_dir = prepare_input_data(config.raw_input_path, config.work_dir, log)
     result: dict[str, list[Path] | Path | None] = {
         "voltage_images": [],
@@ -63,12 +61,12 @@ def run_analysis(config: AnalysisRunConfig, log: LogFn = print) -> dict[str, lis
     }
 
     if config.analysis_type in {"voltage", "all"}:
-        voltage_images, voltage_ppt = run_voltage_analysis(config, date, extracted_data_dir, log)
+        voltage_images, voltage_ppt = run_voltage_analysis(config, dates, extracted_data_dir, log)
         result["voltage_images"] = voltage_images
         result["voltage_ppt"] = voltage_ppt
 
     if config.analysis_type in {"temperature", "all"}:
-        temperature_images, temperature_ppt = run_temperature_analysis(config, date, extracted_data_dir, log)
+        temperature_images, temperature_ppt = run_temperature_analysis(config, dates, extracted_data_dir, log)
         result["temperature_images"] = temperature_images
         result["temperature_ppt"] = temperature_ppt
 
@@ -77,42 +75,30 @@ def run_analysis(config: AnalysisRunConfig, log: LogFn = print) -> dict[str, lis
 
 def prepare_input_data(raw_input_path: Path, work_dir: Path, log: LogFn) -> Path:
     raw_input_path = raw_input_path.resolve()
-    work_dir = work_dir.resolve()
-    extracted_data_dir = work_dir / "extracted"
 
     if raw_input_path.is_dir() and _contains_rbms_dirs(raw_input_path):
-        log(f"检测到已解压目录，直接读取：{raw_input_path}")
+        log(f"直接读取数据文件夹：{raw_input_path}")
         return raw_input_path
 
-    if raw_input_path.is_file() and raw_input_path.suffix.lower() == ".zip":
-        upload_raw_dir = work_dir / "gui_raw_input"
-        upload_raw_dir.mkdir(parents=True, exist_ok=True)
-        target_zip = upload_raw_dir / raw_input_path.name
-        if not target_zip.exists() or target_zip.stat().st_mtime < raw_input_path.stat().st_mtime:
-            shutil.copy2(raw_input_path, target_zip)
-        raw_input_path = upload_raw_dir
-
     if not raw_input_path.is_dir():
-        raise FileNotFoundError(f"输入路径不存在或不是有效目录/zip 文件：{raw_input_path}")
+        raise FileNotFoundError(f"输入路径不存在或不是有效文件夹：{raw_input_path}")
 
-    log(f"解压 zip 压缩包：{raw_input_path}")
-    extract_zip_archives(raw_input_path, extracted_data_dir)
-    return extracted_data_dir
+    raise FileNotFoundError(f"未在输入文件夹中找到 RBMS 数据目录：{raw_input_path}")
 
 
 def run_voltage_analysis(
     config: AnalysisRunConfig,
-    date: str | None,
+    dates: set[str] | None,
     extracted_data_dir: Path,
     log: LogFn,
 ) -> tuple[list[Path], Path | None]:
-    recordings = find_voltage_recordings(extracted_data_dir, date)
+    recordings = find_voltage_recordings(extracted_data_dir, dates)
     if not recordings:
-        date_message = date if date is not None else "全部日期"
+        date_message = _format_date_message(dates)
         log(f"未找到 {date_message} 的 RBMS 电压录播文件：{extracted_data_dir}")
         return [], None
 
-    output_label = date if date is not None else "all_dates"
+    output_label = _format_output_label(dates)
     voltage_output_dir = config.output_dir / "voltage_images" / output_label
     ppt_path = config.output_dir / f"voltage_report_{output_label}.pptx"
     selected_columns = build_voltage_columns(config.cell_count)
@@ -144,17 +130,17 @@ def run_voltage_analysis(
 
 def run_temperature_analysis(
     config: AnalysisRunConfig,
-    date: str | None,
+    dates: set[str] | None,
     extracted_data_dir: Path,
     log: LogFn,
 ) -> tuple[list[Path], Path | None]:
-    recordings = find_temperature_recordings(extracted_data_dir, date)
+    recordings = find_temperature_recordings(extracted_data_dir, dates)
     if not recordings:
-        date_message = date if date is not None else "全部日期"
+        date_message = _format_date_message(dates)
         log(f"未找到 {date_message} 的 RBMS 温度录播文件：{extracted_data_dir}")
         return [], None
 
-    output_label = date if date is not None else "all_dates"
+    output_label = _format_output_label(dates)
     temperature_output_dir = config.output_dir / "temperature_images" / output_label
     ppt_path = config.output_dir / f"temperature_report_{output_label}_{config.temperature_mode}.pptx"
     selected_columns = build_temperature_columns(config.temperature_cell_count)
@@ -195,4 +181,18 @@ def run_temperature_analysis(
 
 
 def _contains_rbms_dirs(path: Path) -> bool:
+    if path.is_dir() and RBMS_FOLDER_PATTERN.match(path.name):
+        return True
     return any(child.is_dir() and RBMS_FOLDER_PATTERN.match(child.name) for child in path.rglob("*"))
+
+
+def _format_date_message(dates: set[str] | None) -> str:
+    if dates is None:
+        return "全部日期"
+    return "、".join(sorted(dates))
+
+
+def _format_output_label(dates: set[str] | None) -> str:
+    if dates is None:
+        return "all_dates"
+    return "_".join(sorted(dates))

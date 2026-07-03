@@ -7,6 +7,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from archive_utils import discover_recording_dates
 from analysis_runner import AnalysisRunConfig, run_analysis
 from config import (
     DEFAULT_CELL_TEMPERATURE_COUNT,
@@ -39,7 +40,9 @@ class DesktopAnalysisApp:
         self.running = False
 
         self.analysis_type = tk.StringVar(value="voltage")
-        self.date = tk.StringVar(value="")
+        self.available_dates: list[str] = []
+        self.select_all_dates = tk.BooleanVar(value=True)
+        self.date_status = tk.StringVar(value="选择数据文件夹后读取日期")
         self.raw_input_path = tk.StringVar(value=str(RAW_DATA_DIR))
         self.output_dir = tk.StringVar(value=str(OUTPUT_DIR))
         self.cell_count = tk.StringVar(value=str(DEFAULT_CELL_VOLTAGE_COUNT))
@@ -51,6 +54,7 @@ class DesktopAnalysisApp:
         self.rest_max_voltage = tk.StringVar(value=str(DEFAULT_REST_MAX_VOLTAGE))
         self.rest_duration_hours = tk.StringVar(value=str(DEFAULT_REST_DURATION_HOURS))
         self.status = tk.StringVar(value="空闲")
+        self.date_listbox: tk.Listbox | None = None
 
         self._configure_root()
         self._build_widgets()
@@ -59,8 +63,8 @@ class DesktopAnalysisApp:
 
     def _configure_root(self) -> None:
         self.root.title("电芯电压/温度分析工具")
-        self.root.geometry("1180x760")
-        self.root.minsize(980, 640)
+        self.root.geometry("1180x820")
+        self.root.minsize(980, 720)
 
         style = ttk.Style()
         if "vista" in style.theme_names():
@@ -99,10 +103,7 @@ class DesktopAnalysisApp:
         ttk.Label(frame, text="输入路径").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
         ttk.Entry(frame, textvariable=self.raw_input_path).grid(row=0, column=1, sticky="ew", padx=8, pady=(10, 4))
         ttk.Button(frame, text="选择文件夹", command=self._choose_input_folder).grid(
-            row=0, column=2, sticky="ew", padx=(0, 8), pady=(10, 4)
-        )
-        ttk.Button(frame, text="选择ZIP", command=self._choose_input_zip).grid(
-            row=0, column=3, sticky="ew", padx=(0, 10), pady=(10, 4)
+            row=0, column=2, columnspan=2, sticky="ew", padx=(0, 10), pady=(10, 4)
         )
 
         ttk.Label(frame, text="输出位置").grid(row=1, column=0, sticky="w", padx=10, pady=4)
@@ -113,7 +114,7 @@ class DesktopAnalysisApp:
 
         self.drop_label = tk.Label(
             frame,
-            text="可将 zip 文件或已解压数据文件夹拖到这里\n也可以使用上方按钮选择路径",
+            text="可将已解压数据文件夹拖到这里\n也可以使用上方按钮选择路径",
             height=4,
             bg="#f8fafc",
             fg="#475569",
@@ -124,7 +125,12 @@ class DesktopAnalysisApp:
         self.drop_label.grid(row=2, column=0, columnspan=4, sticky="ew", padx=10, pady=(8, 10))
 
     def _build_parameter_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="分析参数", style="Section.TLabelframe")
+        self._build_common_parameter_section(parent)
+        self._build_voltage_parameter_section(parent)
+        self._build_temperature_parameter_section(parent)
+
+    def _build_common_parameter_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="分析类型", style="Section.TLabelframe")
         frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         for column in range(4):
             frame.columnconfigure(column, weight=1)
@@ -137,44 +143,71 @@ class DesktopAnalysisApp:
             variable=self.analysis_type,
             values=[("电压", "voltage"), ("温度", "temperature"), ("电压 + 温度", "all")],
         )
-        self._add_entry(frame, 0, 2, "日期（可空）", self.date)
 
-        self._add_entry(frame, 1, 0, "电压测点数量", self.cell_count)
-        self._add_entry(frame, 1, 2, "温度测点数量", self.temperature_cell_count)
-
-        self._add_combo(
+        ttk.Checkbutton(
             frame,
-            row=2,
-            column=0,
-            label="温度代表时刻",
-            variable=self.temperature_mode,
-            values=[("温差最大", "diff"), ("最高温", "max")],
+            text="全选日期",
+            variable=self.select_all_dates,
+            command=self._toggle_all_dates,
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=(8, 2))
+        ttk.Label(frame, textvariable=self.date_status).grid(row=1, column=1, columnspan=3, sticky="w", padx=8, pady=(8, 2))
+
+        self.date_listbox = tk.Listbox(
+            frame,
+            selectmode=tk.EXTENDED,
+            height=5,
+            exportselection=False,
+            font=("Consolas", 9),
         )
+        self.date_listbox.grid(row=2, column=0, columnspan=4, sticky="ew", padx=10, pady=(4, 10))
+        self.date_listbox.bind("<<ListboxSelect>>", self._on_date_select)
+
+    def _build_voltage_parameter_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="电压参数", style="Section.TLabelframe")
+        frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        for column in range(4):
+            frame.columnconfigure(column, weight=1)
+
+        self._add_entry(frame, 0, 0, "电压测点数量", self.cell_count)
         self._add_combo(
             frame,
-            row=2,
+            row=0,
             column=2,
             label="SOC电芯类型",
             variable=self.soc_cell_type,
             values=[("305", "305"), ("315", "315"), ("280", "280"), ("135", "135")],
         )
-
         self._add_combo(
             frame,
-            row=3,
+            row=1,
             column=0,
             label="OCV表方向",
             variable=self.soc_cal_type,
             values=[("dch", "dch"), ("ch", "ch")],
         )
-        self._add_entry(frame, 3, 2, "静置电流阈值A", self.rest_current_threshold)
+        self._add_entry(frame, 1, 2, "静置电流阈值A", self.rest_current_threshold)
+        self._add_entry(frame, 2, 0, "静置最高电压", self.rest_max_voltage)
+        self._add_entry(frame, 2, 2, "静置持续时间h", self.rest_duration_hours)
 
-        self._add_entry(frame, 4, 0, "静置最高电压", self.rest_max_voltage)
-        self._add_entry(frame, 4, 2, "静置持续时间h", self.rest_duration_hours)
+    def _build_temperature_parameter_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="温度参数", style="Section.TLabelframe")
+        frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        for column in range(4):
+            frame.columnconfigure(column, weight=1)
+
+        self._add_entry(frame, 0, 0, "温度测点数量", self.temperature_cell_count)
+        self._add_combo(
+            frame,
+            row=0,
+            column=2,
+            label="温度代表时刻",
+            variable=self.temperature_mode,
+            values=[("温差最大", "diff"), ("最高温", "max")],
+        )
 
     def _build_action_section(self, parent: ttk.Frame) -> None:
         frame = ttk.Frame(parent)
-        frame.grid(row=2, column=0, sticky="ew")
+        frame.grid(row=4, column=0, sticky="ew")
         frame.columnconfigure(2, weight=1)
 
         self.run_button = ttk.Button(frame, text="开始分析", style="Run.TButton", command=self._start_run)
@@ -234,29 +267,24 @@ class DesktopAnalysisApp:
 
     def _setup_drag_drop(self) -> None:
         if not DND_AVAILABLE or DND_FILES is None:
-            self.drop_label.configure(text="拖拽依赖 tkinterdnd2 未安装；仍可使用按钮选择文件或文件夹")
+            self.drop_label.configure(text="拖拽依赖 tkinterdnd2 未安装；仍可使用按钮选择文件夹")
             return
 
         self.drop_label.drop_target_register(DND_FILES)
         self.drop_label.dnd_bind("<<Drop>>", self._handle_drop)
-        self.drop_label.configure(text="将 zip 文件或已解压数据文件夹拖到这里")
+        self.drop_label.configure(text="将已解压数据文件夹拖到这里")
 
     def _handle_drop(self, event: tk.Event) -> None:
         paths = self.root.tk.splitlist(event.data)
         if not paths:
             return
-        self.raw_input_path.set(str(Path(paths[0]).resolve()))
+        self._set_input_path(paths[0])
         self._append_log(f"已选择输入路径：{self.raw_input_path.get()}")
 
     def _choose_input_folder(self) -> None:
-        selected = filedialog.askdirectory(title="选择原始数据文件夹或已解压数据文件夹")
+        selected = filedialog.askdirectory(title="选择已解压数据文件夹")
         if selected:
-            self.raw_input_path.set(selected)
-
-    def _choose_input_zip(self) -> None:
-        selected = filedialog.askopenfilename(title="选择原始数据zip", filetypes=[("ZIP文件", "*.zip"), ("所有文件", "*.*")])
-        if selected:
-            self.raw_input_path.set(selected)
+            self._set_input_path(selected)
 
     def _choose_output_dir(self) -> None:
         selected = filedialog.askdirectory(title="选择输出位置")
@@ -289,10 +317,11 @@ class DesktopAnalysisApp:
         if not output_path:
             raise ValueError("输出位置不能为空。")
 
+        selected_dates = self._get_selected_dates()
         try:
             return AnalysisRunConfig(
                 analysis_type=self.analysis_type.get(),
-                date=self.date.get().strip() or None,
+                dates=selected_dates,
                 raw_input_path=raw_path,
                 output_dir=output_path,
                 work_dir=PROCESSED_DATA_DIR,
@@ -307,6 +336,75 @@ class DesktopAnalysisApp:
             )
         except ValueError as exc:
             raise ValueError("数字参数格式不正确，请检查测点数量和静置阈值。") from exc
+
+    def _set_input_path(self, selected_path: str) -> None:
+        new_path = Path(selected_path).resolve()
+        self.raw_input_path.set(str(new_path))
+        self._load_available_dates(new_path)
+
+    def _load_available_dates(self, input_path: Path) -> None:
+        try:
+            dates = discover_recording_dates(input_path)
+        except Exception as exc:
+            self._update_date_options([])
+            self._append_log(f"读取日期失败：{exc}")
+            return
+
+        self._update_date_options(dates)
+        if dates:
+            self._append_log(f"已读取日期：{'、'.join(dates)}")
+        else:
+            self._append_log("未从输入路径中读取到 RBMS 日期目录。")
+
+    def _update_date_options(self, dates: list[str]) -> None:
+        self.available_dates = dates
+        if self.date_listbox is None:
+            return
+
+        self.date_listbox.delete(0, tk.END)
+        for date in dates:
+            self.date_listbox.insert(tk.END, date)
+
+        self.select_all_dates.set(True)
+        self._select_all_date_items()
+        if dates:
+            self.date_status.set(f"已读取 {len(dates)} 个日期")
+        else:
+            self.date_status.set("未读取到日期，将按全部日期尝试分析")
+
+    def _toggle_all_dates(self) -> None:
+        if self.select_all_dates.get():
+            self._select_all_date_items()
+        elif self.date_listbox is not None:
+            self.date_listbox.selection_clear(0, tk.END)
+
+    def _select_all_date_items(self) -> None:
+        if self.date_listbox is None:
+            return
+
+        self.date_listbox.selection_clear(0, tk.END)
+        if self.available_dates:
+            self.date_listbox.selection_set(0, tk.END)
+
+    def _on_date_select(self, _event: tk.Event | None = None) -> None:
+        if self.date_listbox is None or not self.available_dates:
+            self.select_all_dates.set(True)
+            return
+
+        selected_count = len(self.date_listbox.curselection())
+        self.select_all_dates.set(selected_count == len(self.available_dates))
+
+    def _get_selected_dates(self) -> list[str] | None:
+        if self.select_all_dates.get() or not self.available_dates:
+            return None
+
+        if self.date_listbox is None:
+            return None
+
+        selected_dates = [self.available_dates[index] for index in self.date_listbox.curselection()]
+        if not selected_dates:
+            raise ValueError("请至少选择一个日期，或勾选全选日期。")
+        return selected_dates
 
     def _run_worker(self, config: AnalysisRunConfig) -> None:
         try:
